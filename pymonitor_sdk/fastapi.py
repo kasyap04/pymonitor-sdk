@@ -4,7 +4,7 @@ import asyncio
 import psutil
 import os
 
-from fastapi import FastAPI, Request
+from fastapi import Request
 from starlette.responses import Response
 from starlette.middleware.base import BaseHTTPMiddleware
 
@@ -13,7 +13,6 @@ from pymonitor_sdk.models import exception_event, metric_event
 
 
 _proc = psutil.Process(os.getpid())
-print(f"{_proc   = }")
 
 
 class PyMonitorMiddleware(BaseHTTPMiddleware):
@@ -21,7 +20,7 @@ class PyMonitorMiddleware(BaseHTTPMiddleware):
     Per-request CPU, memory, and duration capture.
     Unhandled exceptions are captured before propagating.
 
-    Add via install() or manually:
+    Add via middleware:
         app.add_middleware(PyMonitorMiddleware, service="my-api")
     """
 
@@ -61,27 +60,3 @@ class PyMonitorMiddleware(BaseHTTPMiddleware):
 
 
         return response
-
-
-def install(app: FastAPI, service: str = "fastapi") -> None:
-    """
-    Wire up monitoring on a FastAPI app with one call.
-
-    Adds:
-    - PyMonitorMiddleware  — per-request CPU/mem/duration + exception capture
-    - shutdown handler   — flushes remaining events before process exits
-
-    Usage:
-        import pymonitor
-        from pymonitor.integrations.fastapi import install
-
-        pymonitor.configure("collector-host", port=9000)
-
-        app = FastAPI()
-        install(app, service="my-api")
-    """
-    app.add_middleware(PyMonitorMiddleware, service=service)
-
-    @app.on_event("shutdown")
-    async def _flush_on_shutdown() -> None:
-        await pymonitor_sdk.shutdown()
