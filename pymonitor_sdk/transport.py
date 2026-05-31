@@ -56,7 +56,7 @@ _HEARTBEAT_FRAME = _HEADER.pack(0)  # zero-length frame = keepalive
 _proc = psutil.Process(os.getpid())
 
 
-def configure(
+def py_minitor_configure(
     host: str = "localhost",
     port: int = 9000,
     service: str = "app",
@@ -64,6 +64,7 @@ def configure(
     flush_interval: float = 1.0,
     queue_maxsize: int = 10_000,
     heartbeat_interval: float = 30.0,
+    poll_interval: float = 5.0,
 ) -> None:
     """
     Call once at application startup.
@@ -71,16 +72,22 @@ def configure(
     Args:
         host:               Collector server hostname or IP.
         port:               Collector TCP port (default 9000).
+        service:            Service name to include in every event, try to `keep unique service` name for each service (default "app").
         batch_size:         Max events per TCP frame. Larger = fewer syscalls.
         flush_interval:     Max seconds to hold a partial batch before flushing.
         queue_maxsize:      In-process event buffer cap. Events beyond this are
                             silently dropped — raise this if your collector goes
                             down for extended periods.
+        poll_interval:      If > 0, sample CPU% and memory usage every N seconds and 
+                            send as a metric_event with context.source="poller". 
+                            This is in addition to the per-request metrics captured 
+                            by the FastAPI middleware, and can be used to track background 
+                            tasks or overall resource usage between requests.
         heartbeat_interval: Seconds between keepalive frames. Keepalives let
                             both sides detect a dead connection without waiting
                             for the next real send to fail.
     """
-    global _host, _port, _service, _batch_size, _flush_interval, _queue_maxsize
+    global _host, _port, _service, _batch_size, _flush_interval, _queue_maxsize, _poll_interval
     global _heartbeat_interval
     _host = host
     _port = port
@@ -89,9 +96,10 @@ def configure(
     _flush_interval = flush_interval
     _queue_maxsize = queue_maxsize
     _heartbeat_interval = heartbeat_interval
+    _poll_interval = poll_interval
 
 
-async def start() -> None:
+async def py_monitor_start() -> None:
     """
     Start the TCP writer and background CPU/memory poller.
 
@@ -99,17 +107,17 @@ async def start() -> None:
     do this automatically — only call manually if wiring things up yourself.
 
         FastAPI lifespan / on_event("startup"):
-            await pymonitor.start()
+            await pymonitor.py_monitor_start()
 
         ARQ WorkerSettings.on_startup:
             async def on_startup(ctx):
-                await pymonitor.start()
+                await pymonitor.py_monitor_start()
     """
     _ensure_writer()
     _ensure_poller()
 
 
-async def shutdown() -> None:
+async def py_monitor_shutdown() -> None:
     """
     Flush remaining queued events and close the TCP connection cleanly.
     Call this from your app's shutdown hook so in-flight events aren't lost.

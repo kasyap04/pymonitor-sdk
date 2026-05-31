@@ -27,7 +27,7 @@ def reset_transport_state():
 
 class TestConfigure:
     def test_defaults(self):
-        transport.configure("collector.example.com")
+        transport.py_minitor_configure("collector.example.com")
         assert transport._host == "collector.example.com"
         assert transport._port == 9000
         assert transport._batch_size == 100
@@ -36,7 +36,7 @@ class TestConfigure:
         assert transport._heartbeat_interval == 30.0
 
     def test_custom_values(self):
-        transport.configure(
+        transport.py_minitor_configure(
             "10.0.0.1",
             port=8080,
             batch_size=50,
@@ -93,7 +93,7 @@ class TestPackFrame:
 class TestEnqueue:
     @pytest.mark.asyncio
     async def test_enqueues_event(self):
-        transport.configure("localhost")
+        transport.py_minitor_configure("localhost")
         evt = Event(event_type=EventType.LOG, service="svc", payload={"msg": "hi"})
 
         with patch.object(transport, "_ensure_writer"):
@@ -149,7 +149,7 @@ class TestShutdown:
     @pytest.mark.asyncio
     async def test_shutdown_no_task(self):
         transport._writer_task = None
-        await transport.shutdown()  # should not raise
+        await transport.py_monitor_shutdown()  # should not raise
 
     @pytest.mark.asyncio
     async def test_shutdown_cancels_task(self):
@@ -157,7 +157,7 @@ class TestShutdown:
             await asyncio.sleep(100)
 
         transport._writer_task = asyncio.get_running_loop().create_task(fake_loop())
-        await transport.shutdown()
+        await transport.py_monitor_shutdown()
         assert transport._writer_task is None
 
 
