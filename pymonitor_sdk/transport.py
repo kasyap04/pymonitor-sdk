@@ -20,6 +20,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import struct
+import psutil
+import os
 from typing import TYPE_CHECKING
 
 import msgpack
@@ -33,13 +35,17 @@ logger = logging.getLogger("pymonitor.transport")
 _host: str = "localhost"
 _port: int = 9000
 _batch_size: int = 100
-_flush_interval: float = 0.0  # max seconds to hold a partial batch
+_flush_interval: float = 1.0  # max seconds to hold a partial batch
 _queue_maxsize: int = 10_000
 _heartbeat_interval: float = 30.0  # seconds between keepalive frames
+_poll_interval: float = 5.0  # 0 = disabled
+_service: str = "app"  # included in every event
 
 # ── Internal state ─────────────────────────────────────────────────────────
 _queue: asyncio.Queue | None = None
 _writer_task: asyncio.Task | None = None
+_poller_task: asyncio.Task | None = None
+
 
 _BACKOFF_MIN: float = 1.0
 _BACKOFF_MAX: float = 60.0
@@ -47,13 +53,18 @@ _HEADER = struct.Struct("!I")  # 4-byte big-endian unsigned int
 _HEARTBEAT_FRAME = _HEADER.pack(0)  # zero-length frame = keepalive
 
 
-def configure(
+_proc = psutil.Process(os.getpid())
+
+
+def py_minitor_configure(
     host: str = "localhost",
     port: int = 9000,
+    service: str = "app",
     batch_size: int = 100,
     flush_interval: float = 1.0,
     queue_maxsize: int = 10_000,
     heartbeat_interval: float = 30.0,
+    poll_interval: float = 5.0,
 ) -> None:
     """
     Call once at application startup.
@@ -61,26 +72,52 @@ def configure(
     Args:
         host:               Collector server hostname or IP.
         port:               Collector TCP port (default 9000).
+        service:            Service name to include in every event, try to `keep unique service` name for each service (default "app").
         batch_size:         Max events per TCP frame. Larger = fewer syscalls.
         flush_interval:     Max seconds to hold a partial batch before flushing.
         queue_maxsize:      In-process event buffer cap. Events beyond this are
                             silently dropped — raise this if your collector goes
                             down for extended periods.
+        poll_interval:      If > 0, sample CPU% and memory usage every N seconds and 
+                            send as a metric_event with context.source="poller". 
+                            This is in addition to the per-request metrics captured 
+                            by the FastAPI middleware, and can be used to track background 
+                            tasks or overall resource usage between requests.
         heartbeat_interval: Seconds between keepalive frames. Keepalives let
                             both sides detect a dead connection without waiting
                             for the next real send to fail.
     """
-    global _host, _port, _batch_size, _flush_interval, _queue_maxsize
+    global _host, _port, _service, _batch_size, _flush_interval, _queue_maxsize, _poll_interval
     global _heartbeat_interval
     _host = host
     _port = port
+    _service = service
     _batch_size = batch_size
     _flush_interval = flush_interval
     _queue_maxsize = queue_maxsize
     _heartbeat_interval = heartbeat_interval
+    _poll_interval = poll_interval
 
 
-async def shutdown() -> None:
+async def py_monitor_start() -> None:
+    """
+    Start the TCP writer and background CPU/memory poller.
+
+    Call from your app's startup hook. install() and patch_worker_settings()
+    do this automatically — only call manually if wiring things up yourself.
+
+        FastAPI lifespan / on_event("startup"):
+            await pymonitor.py_monitor_start()
+
+        ARQ WorkerSettings.on_startup:
+            async def on_startup(ctx):
+                await pymonitor.py_monitor_start()
+    """
+    _ensure_writer()
+    _ensure_poller()
+
+
+async def py_monitor_shutdown() -> None:
     """
     Flush remaining queued events and close the TCP connection cleanly.
     Call this from your app's shutdown hook so in-flight events aren't lost.
@@ -104,7 +141,22 @@ async def shutdown() -> None:
     _writer_task = None
 
 
-# ── Internal helpers ───────────────────────────────────────────────────────
+def _mem_usage_mb() -> float:
+    """Current process memory usage in MB."""
+    return _proc.memory_info().rss / 1024 / 1024
+
+
+def _cpu_usage_percent() -> float:
+    """Current process CPU usage as a percentage."""
+    return _proc.cpu_percent(interval=None)
+
+
+def mem_cpu() -> dict[str, float]:
+    """Convenience for capturing both memory and CPU usage in one call."""
+    return {
+        "mem_mb": _mem_usage_mb(),
+        "cpu_percent": _cpu_usage_percent(),
+    }
 
 
 def _get_queue() -> asyncio.Queue:
@@ -112,15 +164,6 @@ def _get_queue() -> asyncio.Queue:
     if _queue is None:
         _queue = asyncio.Queue(maxsize=_queue_maxsize)
     return _queue
-
-
-async def test_loop():
-    q = _get_queue()
-    while not q.empty():
-        event = await q.get()
-        print(f"\n\nGot event: {event}\n\n")
-
-        q.task_done()
 
 
 async def enqueue(event: "Event") -> None:
@@ -144,20 +187,72 @@ def _ensure_writer() -> None:
     except RuntimeError:
         return  # called outside a running loop — task will spawn on next enqueue
     if _writer_task is None or _writer_task.done():
-        # _writer_task = loop.create_task(test_loop(), name="pymonitor-tcp-writer")
         _writer_task = loop.create_task(_writer_loop(), name="pymonitor-tcp-writer")
 
 
-# ── Wire encoding ──────────────────────────────────────────────────────────
+def _ensure_poller() -> None:
+    global _poller_task
+    if _poll_interval <= 0:
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    if _poller_task is None or _poller_task.done():
+        _poller_task = loop.create_task(_poller_loop(), name="pymonitor-poller")
+
+
+async def _poller_loop() -> None:
+    """
+    Sample process CPU% and RSS memory every _poll_interval seconds.
+
+    psutil.cpu_percent(interval=None) measures CPU time elapsed since the
+    previous call. The first call always returns 0.0 (nothing to compare
+    against), so we prime it once at startup and discard that result.
+    From then on, each call after a sleep(poll_interval) returns the average
+    CPU% over exactly that interval — which is exactly what we want.
+    """
+
+    from pymonitor_sdk import metric_event
+
+    # Prime the CPU counter — first reading is always 0.0, discard it
+    _proc.cpu_percent(interval=None)
+
+    logger.debug(
+        "pymonitor: poller started (interval=%.0fs, service=%s)",
+        _poll_interval,
+        _service,
+    )
+
+    while True:
+        try:
+            await asyncio.sleep(_poll_interval)
+
+            cpu_percent = _proc.cpu_percent(interval=None)
+            mem_info = _proc.memory_info()
+            mem_mb = mem_info.rss / 1024 / 1024
+
+            await enqueue(
+                metric_event(
+                    service=_service,
+                    cpu_percent=round(cpu_percent, 2),
+                    mem_mb=round(mem_mb, 2),
+                    context={"source": "poller"},
+                )
+            )
+            logger.debug(
+                "pymonitor: polled — cpu=%.1f%% mem=%.1fMB", cpu_percent, mem_mb
+            )
+
+        except asyncio.CancelledError:
+            logger.debug("pymonitor: poller stopped")
+            raise
 
 
 def _pack_frame(batch: list[dict]) -> bytes:
     """4-byte length header + msgpack body."""
     body = msgpack.packb(batch, use_bin_type=True)
     return _HEADER.pack(len(body)) + body
-
-
-# ── Writer loop ────────────────────────────────────────────────────────────
 
 
 async def _writer_loop() -> None:
@@ -236,6 +331,7 @@ async def _connected(writer: asyncio.StreamWriter) -> None:
             {send_task, hb_task},
             return_when=asyncio.FIRST_COMPLETED,
         )
+
         # Cancel the sibling task
         for t in pending:
             t.cancel()
@@ -243,12 +339,14 @@ async def _connected(writer: asyncio.StreamWriter) -> None:
                 await t
             except (asyncio.CancelledError, Exception):
                 pass
+
         # Re-raise the exception from the task that died (if any)
         for t in done:
             if not t.cancelled():
                 exc = t.exception()
                 if exc is not None:
                     raise exc
+
     except asyncio.CancelledError:
         # Shutdown path — flush whatever remains in the batch
         send_task.cancel()
@@ -271,14 +369,11 @@ async def _send_loop(writer: asyncio.StreamWriter) -> None:
     batch: list[dict] = []
     loop = asyncio.get_running_loop()
 
-    # _batch_size = 1
-
     while True:
         deadline = loop.time() + _flush_interval
 
         while len(batch) < _batch_size:
             remaining = deadline - loop.time()
-            print(f"{remaining = }")
             if remaining <= 0:
                 break
             try:
@@ -286,8 +381,7 @@ async def _send_loop(writer: asyncio.StreamWriter) -> None:
                 batch.append(event)
             except asyncio.TimeoutError:
                 break
-        
-        print(f"\n\nBatch size: {batch} === {_batch_size}  {loop.time()}\n\n")
+
         if batch:
             writer.write(_pack_frame(batch))
             await writer.drain()  # raises immediately if connection is broken
@@ -301,6 +395,7 @@ async def _heartbeat_loop(writer: asyncio.StreamWriter) -> None:
     Causes a BrokenPipeError quickly if the peer has gone away, which
     triggers reconnection faster than waiting for a real send to fail.
     """
+
     while True:
         await asyncio.sleep(_heartbeat_interval)
         writer.write(_HEARTBEAT_FRAME)
