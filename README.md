@@ -1,6 +1,6 @@
 # pymonitor-sdk
 
-Lightweight monitoring SDK for FastAPI applications. Captures per-request CPU, memory, duration, and unhandled exceptions, then ships them over a persistent TCP connection to a [pymonitor-collector](https://github.com/yourorg/pymonitor-collector) instance.
+Lightweight monitoring SDK for FastAPI applications. Captures per-request CPU, memory, duration, and unhandled exceptions, then ships them over a persistent TCP connection to a [pymonitor-collector](https://github.com/kasyap04/pymonitor) instance.
 
 ## Installation
 
